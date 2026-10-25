@@ -42,7 +42,84 @@ const String iosAudioModeVideoRecording = 'iosAudioModeVideoRecording';
 const String iosAudioModeVoiceChat = 'iosAudioModeVoiceChat';
 const String iosAudioModeVoicePrompt = 'iosAudioModeVoicePrompt';
 
-enum TextToSpeechPlatform { android, ios }
+enum TextToSpeechPlatform { android, ios, macos }
+
+/// Keys that may be present in the maps returned by [FlutterTts.getVoices].
+///
+/// Not every platform populates every key. See the platform notes on
+/// [FlutterTts.getVoices] for details.
+class TtsVoiceKeys {
+  TtsVoiceKeys._();
+
+  /// The human readable voice name (for example `Karen`).
+  static const String name = 'name';
+
+  /// The BCP-47 locale of the voice (for example `en-AU`).
+  static const String locale = 'locale';
+
+  /// The platform specific voice quality, when available.
+  static const String quality = 'quality';
+
+  /// The voice gender, when available.
+  static const String gender = 'gender';
+
+  /// The platform specific voice identifier, when available.
+  static const String identifier = 'identifier';
+
+  /// The platform specific latency, when available (Android only).
+  static const String latency = 'latency';
+
+  /// `1` when the voice requires a network connection, `0` otherwise
+  /// (Android only).
+  static const String networkRequired = 'network_required';
+
+  /// Tab separated voice features (Android only).
+  static const String features = 'features';
+}
+
+/// Returns the voices whose locale matches [locale].
+///
+/// A locale without a region (for example `ar` or `fr`) matches every regional
+/// variant of that language (`ar-SA`, `fr-CA`, ...). A locale with a region
+/// (for example `en-GB`) only matches that exact locale.
+///
+/// Set [matchLanguageOnly] to `true` to ignore the region even when [locale]
+/// contains one.
+///
+/// This is a pure helper so it can be used to filter voices returned from
+/// [FlutterTts.getVoices] without another platform call.
+List<Map<String, dynamic>> filterVoicesByLocale(
+  List<dynamic> voices,
+  String locale, {
+  bool matchLanguageOnly = false,
+}) {
+  final normalizedLocale = _normalizeLocale(locale);
+  if (normalizedLocale.isEmpty) return const <Map<String, dynamic>>[];
+
+  final language = normalizedLocale.split('-').first;
+  final ignoreRegion = matchLanguageOnly || !normalizedLocale.contains('-');
+
+  final matches = <Map<String, dynamic>>[];
+  for (final voice in voices) {
+    if (voice is! Map) continue;
+
+    final voiceLocale =
+        _normalizeLocale(voice[TtsVoiceKeys.locale]?.toString() ?? '');
+    if (voiceLocale.isEmpty) continue;
+
+    final isMatch = ignoreRegion
+        ? voiceLocale == language || voiceLocale.split('-').first == language
+        : voiceLocale == normalizedLocale;
+
+    if (isMatch) {
+      matches.add(voice.cast<String, dynamic>());
+    }
+  }
+  return matches;
+}
+
+String _normalizeLocale(String locale) =>
+    locale.trim().replaceAll('_', '-').toLowerCase();
 
 /// Audio session category identifiers for iOS.
 ///
@@ -446,7 +523,7 @@ class FlutterTts {
       IosTextToSpeechAudioMode.voiceChat: iosAudioModeVoiceChat,
       IosTextToSpeechAudioMode.voicePrompt: iosAudioModeVoicePrompt,
     };
-    if (!Platform.isIOS) return;
+    if (kIsWeb || !Platform.isIOS) return;
     try {
       return await _channel
           .invokeMethod<dynamic>('setIosAudioCategory', <String, dynamic>{
@@ -458,13 +535,15 @@ class FlutterTts {
     } on PlatformException catch (e) {
       print(
           'setIosAudioCategory error, category: $category, mode: $mode, error: ${e.message}');
+    } on MissingPluginException {
+      // The iOS implementation is not registered (for example in a unit test).
     }
   }
 
   /// [Future] which invokes the platform specific method for setEngine
   /// ***Android supported only***
   Future<dynamic> setEngine(String engine) async {
-    await _channel.invokeMethod('setEngine', engine);
+    return await _channel.invokeMethod('setEngine', engine);
   }
 
   /// [Future] which invokes the platform specific method for setPitch
@@ -485,62 +564,120 @@ class FlutterTts {
   Future<dynamic> stop() async => await _channel.invokeMethod('stop');
 
   /// [Future] which invokes the platform specific method for getLanguages
-  /// Android issues with API 21 & 22
-  /// Returns a list of available languages
-  Future<dynamic> get getLanguages async {
-    final languages = await _channel.invokeMethod('getLanguages');
-    return languages;
+  /// Returns a list of available languages.
+  ///
+  /// The list is empty on platforms that do not implement this method.
+  Future<List<String>> get getLanguages async {
+    final languages =
+        await _channel.invokeMethod<List<dynamic>>('getLanguages');
+    return (languages ?? const <dynamic>[])
+        .map((language) => language.toString())
+        .toList(growable: false);
   }
 
   /// [Future] which invokes the platform specific method for getEngines
   /// Returns a list of installed TTS engines
   /// ***Android supported only***
-  Future<dynamic> get getEngines async {
-    final engines = await _channel.invokeMethod('getEngines');
-    return engines;
+  Future<List<String>> get getEngines async {
+    final engines = await _channel.invokeMethod<List<dynamic>>('getEngines');
+    return (engines ?? const <dynamic>[])
+        .map((engine) => engine.toString())
+        .toList(growable: false);
   }
 
   /// [Future] which invokes the platform specific method for getDefaultEngine
   /// Returns a `String` of the default engine name
   /// ***Android supported only ***
-  Future<dynamic> get getDefaultEngine async {
-    final engineName = await _channel.invokeMethod('getDefaultEngine');
-    return engineName;
+  Future<String?> get getDefaultEngine async {
+    return await _channel.invokeMethod<String?>('getDefaultEngine');
   }
 
   /// [Future] which invokes the platform specific method for getDefaultVoice
   /// Returns a `Map` containing a voice name and locale
   /// ***Android supported only ***
-  Future<dynamic> get getDefaultVoice async {
-    final voice = await _channel.invokeMethod('getDefaultVoice');
-    return voice;
+  Future<Map<String, dynamic>> get getDefaultVoice async {
+    final voice =
+        await _channel.invokeMethod<Map<dynamic, dynamic>>('getDefaultVoice');
+    return voice?.cast<String, dynamic>() ?? <String, dynamic>{};
   }
 
   /// [Future] which invokes the platform specific method for getVoices
-  /// Returns a `List` of `Maps` containing a voice name and locale
-  /// For iOS specifically, it also includes quality, gender, and identifier
-  /// ***Android, iOS, and macOS supported only***
-  Future<dynamic> get getVoices async {
-    final voices = await _channel.invokeMethod('getVoices');
-    return voices;
+  /// Returns a `List` of `Maps` containing a voice name and locale.
+  ///
+  /// Platform specific keys are documented by [TtsVoiceKeys]:
+  /// * iOS and macOS: `quality`, `gender`, `identifier`
+  /// * Android: `quality`, `latency`, `network_required`, `features`
+  /// * Windows (UWP voices): `gender`, `identifier`
+  ///
+  /// Use [getVoicesForLanguage] or [getVoicesForLocale] to select the voices
+  /// for one language instead of filtering the result yourself.
+  ///
+  /// ***Android, iOS, macOS, Web, and Windows supported***
+  Future<List<Map<String, dynamic>>> get getVoices async {
+    final voices = await _channel.invokeMethod<List<dynamic>>('getVoices');
+    return (voices ?? const <dynamic>[])
+        .whereType<Map<dynamic, dynamic>>()
+        .map((voice) => voice.cast<String, dynamic>())
+        .toList(growable: false);
+  }
+
+  /// Returns the voices that speak [language].
+  ///
+  /// [language] is a BCP-47 language tag. A bare language code such as `ar`,
+  /// `fr`, or `zh` matches every regional variant (`ar-SA`, `fr-CA`,
+  /// `zh-CN`, ...). This is the recommended way to answer questions like
+  /// "which Arabic voices are installed?".
+  ///
+  /// ```dart
+  /// final arabicVoices = await flutterTts.getVoicesForLanguage('ar');
+  /// ```
+  Future<List<Map<String, dynamic>>> getVoicesForLanguage(
+      String language) async {
+    final voices = await getVoices;
+    return filterVoicesByLocale(voices, language, matchLanguageOnly: true);
+  }
+
+  /// Returns the voices for an exact locale, or for every regional variant of
+  /// [locale] when it does not contain a region.
+  ///
+  /// ```dart
+  /// final britishEnglish = await flutterTts.getVoicesForLocale('en-GB');
+  /// final allEnglish = await flutterTts.getVoicesForLocale('en');
+  /// ```
+  Future<List<Map<String, dynamic>>> getVoicesForLocale(String locale) async {
+    final voices = await getVoices;
+    return filterVoicesByLocale(voices, locale);
   }
 
   /// [Future] which invokes the platform specific method for isLanguageAvailable
   /// Returns `true` or `false`
-  Future<dynamic> isLanguageAvailable(String language) async =>
-      await _channel.invokeMethod('isLanguageAvailable', language);
+  Future<bool> isLanguageAvailable(String language) async {
+    final available =
+        await _channel.invokeMethod<bool>('isLanguageAvailable', language);
+    return available ?? false;
+  }
 
   /// [Future] which invokes the platform specific method for isLanguageInstalled
   /// Returns `true` or `false`
   /// ***Android supported only***
-  Future<dynamic> isLanguageInstalled(String language) async =>
-      await _channel.invokeMethod('isLanguageInstalled', language);
+  Future<bool> isLanguageInstalled(String language) async {
+    final installed =
+        await _channel.invokeMethod<bool>('isLanguageInstalled', language);
+    return installed ?? false;
+  }
 
   /// [Future] which invokes the platform specific method for areLanguagesInstalled
   /// Returns a HashMap with `true` or `false` for each submitted language.
   /// ***Android supported only***
-  Future<dynamic> areLanguagesInstalled(List<String> languages) async =>
-      await _channel.invokeMethod('areLanguagesInstalled', languages);
+  Future<Map<String, bool>> areLanguagesInstalled(
+      List<String> languages) async {
+    final installed = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+        'areLanguagesInstalled', languages);
+    return installed?.map(
+          (language, value) => MapEntry(language.toString(), value == true),
+        ) ??
+        <String, bool>{};
+  }
 
   Future<SpeechRateValidRange> get getSpeechRateValidRange async {
     final validRange = await _channel.invokeMethod('getSpeechRateValidRange')
@@ -549,8 +686,10 @@ class FlutterTts {
     final normal = double.parse(validRange['normal'].toString());
     final max = double.parse(validRange['max'].toString());
     final platformStr = validRange['platform'].toString();
-    final platform =
-        TextToSpeechPlatform.values.firstWhere((e) => e.name == platformStr);
+    final platform = TextToSpeechPlatform.values.firstWhere(
+      (e) => e.name == platformStr,
+      orElse: () => TextToSpeechPlatform.android,
+    );
 
     return SpeechRateValidRange(min, normal, max, platform);
   }
@@ -643,13 +782,15 @@ class FlutterTts {
         break;
       case 'speak.onProgress':
         if (progressHandler != null) {
-          final args = call.arguments as Map<dynamic, dynamic>;
-          progressHandler!(
-            args['text'].toString(),
-            int.parse(args['start'].toString()),
-            int.parse(args['end'].toString()),
-            args['word'].toString(),
-          );
+          final args = call.arguments;
+          if (args is Map) {
+            progressHandler!(
+              args['text']?.toString() ?? '',
+              int.tryParse(args['start']?.toString() ?? '') ?? 0,
+              int.tryParse(args['end']?.toString() ?? '') ?? 0,
+              args['word']?.toString() ?? '',
+            );
+          }
         }
         break;
       case "synth.onError":

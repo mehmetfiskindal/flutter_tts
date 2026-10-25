@@ -126,10 +126,10 @@ class MyAppState extends State<MyApp> {
   Future<void> _getDefaultEngine() async {
     if (!isAndroid) return; // safety-check
     if (kDebugMode) debugPrint('_getDefaultEngine...');
-    var e = await flutterTts.getDefaultEngine;
+    final e = await flutterTts.getDefaultEngine;
     if (e != null) {
       if (kDebugMode) debugPrint('Default Engine: $e');
-      setState(() => engine = e as String);
+      setState(() => engine = e);
     }
   }
 
@@ -159,7 +159,7 @@ class MyAppState extends State<MyApp> {
     if (isAndroid) {
       var defVoice = await flutterTts.getDefaultVoice;
       if (kDebugMode) debugPrint('Android Default Voice: $defVoice');
-      if (defVoice != null) {
+      if (defVoice.isNotEmpty) {
         var rawVoice = rawVoices.firstWhere((v) => mapEquals(v, defVoice));
         voice = rawVoice;
         if (voice != null) changedVoicesDropDownItem(voice);
@@ -339,7 +339,7 @@ class MyAppState extends State<MyApp> {
     if (isAndroid) {
       flutterTts
           .isLanguageInstalled(language!)
-          .then((value) => isCurrentLanguageInstalled = (value as bool));
+          .then((value) => isCurrentLanguageInstalled = value);
     } else {
       isCurrentLanguageInstalled = false;
     }

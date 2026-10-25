@@ -20,9 +20,9 @@ A flutter text to speech plugin (Swift,Kotlin)
   - [x] is language available
 - [x] Android, iOS, Web
   - [x] speech marks (requires iOS 7+, Android 26+, and default voice engine for web)
-- [x] Android, iOS
-  - [x] synthesize to file (requires iOS 13+)
-- [x] Android, iOS, Web, & Windows
+- [x] Android, iOS, macOS
+  - [x] synthesize to file (requires iOS 13+ / macOS 10.15+)
+- [x] Android, iOS, macOS, Web, & Windows
   - [x] pause
 - [x] Android
   - [x] set silence
@@ -43,7 +43,7 @@ A flutter text to speech plugin (Swift,Kotlin)
 ## macOS
 
 ```bash
-OSX version: 10.15
+macOS version: 10.15 or newer
 ```
 
 [Example App](https://github.com/dlutton/flutter_tts/tree/macOS_app) from the macOS_app branch
@@ -58,29 +58,25 @@ Progress updates are only supported for native speech synsthesis. Use the defaul
 
 ## Android
 
-Change the minimum Android sdk version to 21 (or higher) in your `android/app/build.gradle` file.
+Use a minimum Android SDK version of 24 (or higher) in your `android/app/build.gradle` file. This is the minimum supported by the plugin.
 
 ```groovy
-minSdkVersion 21
+minSdkVersion 24
 ```
 
-**Update the Kotlin Gradle Plugin Version**
+**Kotlin and Android Gradle Plugin**
 
-Change the verision of the Kotlin Gradle plugin to `1.9.10`. <br>
-If your project was created with a version of Flutter before 3.19, go to the `android/build.gradle` file and update the `ext.kotlin_version`:
+The plugin is built with Kotlin 2.2 and Android Gradle Plugin 8.13. Use a compatible Android Gradle Plugin and Gradle version; current Flutter stable templates already satisfy these requirements. If your project was created with an older Flutter version, update the Kotlin plugin in `android/settings.gradle`:
+
 ```groovy
-ext.kotlin_version = '1.9.10'
+id "org.jetbrains.kotlin.android" version "2.2.20" apply false
 ```
 
-Otherwise go to `android/settings.gradle` and update the verion of the plugin `org.jetbrains.kotlin.android`:
-```groovy
-id "org.jetbrains.kotlin.android" version "1.9.10" apply false
-```
-
-
-Apps targeting Android 11 that use text-to-speech should
-declare [`TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE`](https://developer.android.com/reference/android/speech/tts/TextToSpeech.Engine#INTENT_ACTION_TTS_SERVICE)
-in the `queries` elements of their manifest.
+Version 4.3.0 of the plugin declares
+[`TextToSpeech.Engine.INTENT_ACTION_TTS_SERVICE`](https://developer.android.com/reference/android/speech/tts/TextToSpeech.Engine#INTENT_ACTION_TTS_SERVICE)
+in its own manifest. Host apps using 4.3.0 or newer do not need to add the
+`queries` element themselves. Apps that target Android 11+ and use an older
+plugin version should add it:
 
 ```xml
 <queries>
@@ -166,7 +162,7 @@ Future _stop() async{
     if (result == 1) setState(() => ttsState = TtsState.stopped);
 }
 
-List<dynamic> languages = await flutterTts.getLanguages;
+List<String> languages = await flutterTts.getLanguages;
 
 await flutterTts.setLanguage("en-US");
 
@@ -178,7 +174,7 @@ await flutterTts.setPitch(1.0);
 
 await flutterTts.isLanguageAvailable("en-US");
 
-// iOS, Android and Web only
+// Android, iOS, macOS, Web and Windows
 //see the "Pausing on Android" section for more info
 await flutterTts.pause();
 
@@ -187,10 +183,29 @@ await flutterTts.pause();
 await flutterTts.synthesizeToFile("Hello World", Platform.isAndroid ? "tts.wav" : "tts.caf", false);
 
 // Each voice is a Map containing at least these keys: name, locale
-// - Windows (UWP voices) only: gender, identifier
+// - Windows (UWP and SAPI voices): gender, identifier
 // - iOS, macOS only: quality, gender, identifier
-// - Android only: quality, latency, network_required, features 
-List<Map> voices = await flutterTts.getVoices;
+// - Android only: quality, latency, network_required, features
+List<Map<String, dynamic>> voices = await flutterTts.getVoices;
+
+// Select the voices for one language. A bare language code matches every
+// regional variant, so this returns ar-SA, ar-EG, ar-AE, ...
+List<Map<String, dynamic>> arabicVoices =
+    await flutterTts.getVoicesForLanguage('ar');
+
+// Use a full locale when you need an exact match.
+List<Map<String, dynamic>> britishVoices =
+    await flutterTts.getVoicesForLocale('en-GB');
+
+// The same filtering is available as a pure helper, so an existing list can
+// be filtered without another platform call. Chinese, French, ...
+List<Map<String, dynamic>> chineseVoices =
+    filterVoicesByLocale(voices, 'zh');
+
+// Keys are also available as constants for type-safe access.
+for (final voice in arabicVoices) {
+  print('${voice[TtsVoiceKeys.name]} (${voice[TtsVoiceKeys.locale]})');
+}
 
 await flutterTts.setVoice({"name": "Karen", "locale": "en-AU"});
 // iOS, macOS only
@@ -217,6 +232,20 @@ await flutterTts.setQueueMode(1);
 await flutterTts.getMaxSpeechInputLength;
 
 await flutterTts.setAudioAttributesForNavigation();
+```
+
+### Getting voices for a specific language
+
+`getVoicesForLanguage` filters the installed voices by language, while
+`getVoicesForLocale` filters by a specific locale. Both accept BCP-47 tags.
+A bare language code such as `ar`, `zh`, or `fr` returns every regional
+variant installed on the device. If you already have the list from
+`getVoices`, use the pure `filterVoicesByLocale` helper instead.
+
+```dart
+final arabic = await flutterTts.getVoicesForLanguage('ar');
+final french = await flutterTts.getVoicesForLanguage('fr');
+final chinese = await flutterTts.getVoicesForLanguage('zh');
 ```
 
 ### Listening for platform calls

@@ -44,7 +44,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var context: Context? = null
     private var tts: TextToSpeech? = null
     private val tag = "TTS"
-    private val pendingMethodCalls = ArrayList<Runnable>()
+    private val pendingMethodCalls = ArrayList<PendingCall>()
     private val utterances = HashMap<String, String>()
     private var bundle: Bundle? = null
     private var silencems = 0
@@ -53,12 +53,15 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private var pauseText: String? = null
     private var isPaused: Boolean = false
     private var queueMode: Int = TextToSpeech.QUEUE_FLUSH
+    @Volatile
     private var ttsStatus: Int? = null
     private var selectedEngine: String? = null
     private var engineResult: Result? = null
     private var parcelFileDescriptor: ParcelFileDescriptor? = null
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
+
+    private data class PendingCall(val call: MethodCall, val result: Result)
 
     companion object {
         private const val SILENCE_PREFIX = "SIL_"
@@ -71,7 +74,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         methodChannel!!.setMethodCallHandler(this)
         handler = Handler(Looper.getMainLooper())
         bundle = Bundle()
-        tts = TextToSpeech(context, onInitListenerWithoutCallback)
+        tts = TextToSpeech(context, onInitListener)
     }
 
     /** Android Plugin APIs  */
@@ -80,11 +83,23 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        stop()
-        tts!!.shutdown()
+        try {
+            stop()
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to stop TextToSpeech: ${e.message}")
+        }
+        tts?.shutdown()
+        tts = null
         context = null
-        methodChannel!!.setMethodCallHandler(null)
+        methodChannel?.setMethodCallHandler(null)
         methodChannel = null
+        handler = null
+        synchronized(this) {
+            pendingMethodCalls.clear()
+        }
+        engineResult = null
+        speakResult = null
+        synthResult = null
     }
 
     private val utteranceProgressListener: UtteranceProgressListener =
@@ -102,7 +117,8 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                     }
                 }
                 if (Build.VERSION.SDK_INT < 26) {
-                    onProgress(utteranceId, 0, utterances[utteranceId]!!.length)
+                    val text = utterances[utteranceId]
+                    onProgress(utteranceId, 0, text?.length ?: 0)
                 }
             }
 
@@ -133,25 +149,35 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                     tag,
                     "Utterance ID has been stopped: $utteranceId. Interrupted: $interrupted"
                 )
-                if (awaitSpeakCompletion) {
-                    speaking = false
-                }
-                if (isPaused) {
-                    invokeMethod("speak.onPause", true)
+                if (utteranceId.startsWith(SYNTHESIZE_TO_FILE_PREFIX)) {
+                    closeParcelFileDescriptor(true)
+                    if (awaitSynthCompletion) {
+                        synthCompletion(0)
+                    }
+                    invokeMethod("synth.onCancel", true)
                 } else {
-                    invokeMethod("speak.onCancel", true)
+                    if (awaitSpeakCompletion) {
+                        speaking = false
+                    }
+                    if (isPaused) {
+                        invokeMethod("speak.onPause", true)
+                    } else {
+                        invokeMethod("speak.onCancel", true)
+                    }
                 }
                 releaseAudioFocus()
             }
 
             private fun onProgress(utteranceId: String?, startAt: Int, endAt: Int) {
                 if (utteranceId != null && !utteranceId.startsWith(SYNTHESIZE_TO_FILE_PREFIX)) {
-                    val text = utterances[utteranceId]
+                    val text = utterances[utteranceId] ?: return
+                    val start = startAt.coerceIn(0, text.length)
+                    val end = endAt.coerceIn(start, text.length)
                     val data = HashMap<String, String?>()
                     data["text"] = text
-                    data["start"] = startAt.toString()
-                    data["end"] = endAt.toString()
-                    data["word"] = text!!.substring(startAt, endAt)
+                    data["start"] = start.toString()
+                    data["end"] = end.toString()
+                    data["word"] = text.substring(start, end)
                     invokeMethod("speak.onProgress", data)
                 }
             }
@@ -167,40 +193,36 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
             @Deprecated("")
             override fun onError(utteranceId: String) {
-                if (utteranceId.startsWith(SYNTHESIZE_TO_FILE_PREFIX)) {
-                    closeParcelFileDescriptor(true)
-                    if (awaitSynthCompletion) {
-                        synth = false
-                    }
-                    invokeMethod("synth.onError", "Error from TextToSpeech (synth)")
-                } else {
-                    if (awaitSpeakCompletion) {
-                        speaking = false
-                    }
-                    invokeMethod("speak.onError", "Error from TextToSpeech (speak)")
-                }
+                handleUtteranceError(utteranceId, "Error from TextToSpeech")
                 releaseAudioFocus()
             }
 
             override fun onError(utteranceId: String, errorCode: Int) {
+                handleUtteranceError(utteranceId, "Error from TextToSpeech - $errorCode")
+                releaseAudioFocus()
+            }
+
+            private fun handleUtteranceError(utteranceId: String, message: String) {
                 if (utteranceId.startsWith(SYNTHESIZE_TO_FILE_PREFIX)) {
                     closeParcelFileDescriptor(true)
                     if (awaitSynthCompletion) {
                         synth = false
+                        synthCompletion(0)
                     }
-                    invokeMethod("synth.onError", "Error from TextToSpeech (synth) - $errorCode")
+                    invokeMethod("synth.onError", "$message (synth)")
                 } else {
                     if (awaitSpeakCompletion) {
                         speaking = false
+                        speakCompletion(0)
                     }
-                    invokeMethod("speak.onError", "Error from TextToSpeech (speak) - $errorCode")
+                    invokeMethod("speak.onError", "$message (speak)")
                 }
             }
         }
 
     fun speakCompletion(success: Int) {
         speaking = false
-        handler!!.post {
+        handler?.post {
             speakResult?.success(success)
             speakResult = null
         }
@@ -208,60 +230,22 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
     fun synthCompletion(success: Int) {
         synth = false
-        handler!!.post {
+        handler?.post {
             synthResult?.success(success)
             synthResult = null
         }
     }
 
-    private val onInitListenerWithCallback: TextToSpeech.OnInitListener =
+    private val onInitListener: TextToSpeech.OnInitListener =
         TextToSpeech.OnInitListener { status ->
-            // Handle pending method calls (sent while TTS was initializing)
-            synchronized(this@FlutterTtsPlugin) {
-                ttsStatus = status
-                for (call in pendingMethodCalls) {
-                    call.run()
-                }
-                pendingMethodCalls.clear()
-            }
+            ttsStatus = status
 
             if (status == TextToSpeech.SUCCESS) {
-                tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
+                tts?.setOnUtteranceProgressListener(utteranceProgressListener)
                 try {
-                    val locale: Locale = tts!!.defaultVoice.locale
-                    if (isLanguageAvailable(locale)) {
-                        tts!!.language = locale
-                    }
-                } catch (e: NullPointerException) {
-                    Log.e(tag, "getDefaultLocale: " + e.message)
-                } catch (e: IllegalArgumentException) {
-                    Log.e(tag, "getDefaultLocale: " + e.message)
-                }
-
-                engineResult!!.success(1)
-            } else {
-                engineResult!!.error("TtsError","Failed to initialize TextToSpeech with status: $status", null)
-            }
-            //engineResult = null
-        }
-
-    private val onInitListenerWithoutCallback: TextToSpeech.OnInitListener =
-        TextToSpeech.OnInitListener { status ->
-            // Handle pending method calls (sent while TTS was initializing)
-            synchronized(this@FlutterTtsPlugin) {
-                ttsStatus = status
-                for (call in pendingMethodCalls) {
-                    call.run()
-                }
-                pendingMethodCalls.clear()
-            }
-
-            if (status == TextToSpeech.SUCCESS) {
-                tts!!.setOnUtteranceProgressListener(utteranceProgressListener)
-                try {
-                    val locale: Locale = tts!!.defaultVoice.locale
-                    if (isLanguageAvailable(locale)) {
-                        tts!!.language = locale
+                    val locale: Locale? = tts?.defaultVoice?.locale
+                    if (locale != null && isLanguageAvailable(locale)) {
+                        tts?.language = locale
                     }
                 } catch (e: NullPointerException) {
                     Log.e(tag, "getDefaultLocale: " + e.message)
@@ -271,6 +255,45 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             } else {
                 Log.e(tag, "Failed to initialize TextToSpeech with status: $status")
             }
+
+            // Copy the pending calls while holding the lock, then run them
+            // outside of it. Running them inside the synchronized block used to
+            // modify the list while iterating and could re-enter onMethodCall,
+            // which caused ConcurrentModificationException and replies sent
+            // twice.
+            val pending: List<PendingCall>
+            synchronized(this@FlutterTtsPlugin) {
+                pending = ArrayList(pendingMethodCalls)
+                pendingMethodCalls.clear()
+            }
+
+            if (status == TextToSpeech.SUCCESS) {
+                for (pendingCall in pending) {
+                    onMethodCall(pendingCall.call, pendingCall.result)
+                }
+            } else {
+                for (pendingCall in pending) {
+                    pendingCall.result.error(
+                        "TtsError",
+                        "Failed to initialize TextToSpeech with status: $status",
+                        null
+                    )
+                }
+            }
+
+            val result = engineResult
+            engineResult = null
+            if (result != null) {
+                if (status == TextToSpeech.SUCCESS) {
+                    result.success(1)
+                } else {
+                    result.error(
+                        "TtsError",
+                        "Failed to initialize TextToSpeech with status: $status",
+                        null
+                    )
+                }
+            }
         }
 
     override fun onMethodCall(call: MethodCall, result: Result) {
@@ -278,10 +301,21 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         synchronized(this@FlutterTtsPlugin) {
             if (ttsStatus == null) {
                 // Suspend method call until the TTS engine is ready
-                val suspendedCall = Runnable { onMethodCall(call, result) }
-                pendingMethodCalls.add(suspendedCall)
+                pendingMethodCalls.add(PendingCall(call, result))
                 return
             }
+        }
+        val status = ttsStatus
+        if (status != TextToSpeech.SUCCESS &&
+            call.method != "setEngine" &&
+            call.method != "getMaxSpeechInputLength"
+        ) {
+            result.error(
+                "TtsError",
+                "TextToSpeech is not initialized (status: $status)",
+                null
+            )
+            return
         }
         when (call.method) {
             "speak" -> {
@@ -311,8 +345,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 val b = speak(text, focus)
                 if (!b) {
                     synchronized(this@FlutterTtsPlugin) {
-                        val suspendedCall = Runnable { onMethodCall(call, result) }
-                        pendingMethodCalls.add(suspendedCall)
+                        pendingMethodCalls.add(PendingCall(call, result))
                     }
                     return
                 }
@@ -341,32 +374,42 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
 
             "synthesizeToFile" -> {
-                val text: String? = call.argument("text")
+                val text = call.argument<String?>("text")
                 if (synth) {
                     result.success(0)
                     return
                 }
-                val fileName: String? = call.argument("fileName")
-                val isFullPath: Boolean? = call.argument("isFullPath")
-                synthesizeToFile(text!!, fileName!!, isFullPath!!)
+                val fileName = call.argument<String?>("fileName")
+                if (text == null || fileName == null) {
+                    result.success(0)
+                    return
+                }
+                val isFullPath = call.argument<Boolean?>("isFullPath") ?: false
                 if (awaitSynthCompletion) {
                     synth = true
                     synthResult = result
-                } else {
+                }
+                val started = synthesizeToFile(text, fileName, isFullPath)
+                if (!started) {
+                    synth = false
+                    synthResult = null
+                    result.success(0)
+                } else if (!awaitSynthCompletion) {
                     result.success(1)
                 }
             }
 
             "pause" -> {
                 isPaused = true
-                if (pauseText != null) {
-                    pauseText = pauseText!!.substring(lastProgress)
+                val text = pauseText
+                if (text != null) {
+                    val start = lastProgress.coerceIn(0, text.length)
+                    pauseText = if (start < text.length) text.substring(start) else null
                 }
                 stop()
                 result.success(1)
                 if (speakResult != null) {
-                    speakResult!!.success(0)
-                    speakResult = null
+                    speakCompletion(0)
                 }
             }
 
@@ -377,8 +420,10 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 lastProgress = 0
                 result.success(1)
                 if (speakResult != null) {
-                    speakResult!!.success(0)
-                    speakResult = null
+                    speakCompletion(0)
+                }
+                if (synthResult != null) {
+                    synthCompletion(0)
                 }
             }
 
@@ -431,7 +476,8 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
 
             "setSilence" -> {
                 val silencems: String = call.arguments.toString()
-                this.silencems = silencems.toInt()
+                this.silencems = silencems.toIntOrNull() ?: 0
+                result.success(1)
             }
 
             "setSharedInstance" -> result.success(1)
@@ -498,7 +544,12 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
         ttsStatus = null
         selectedEngine = engine
         engineResult = result
-        tts = TextToSpeech(context, onInitListenerWithCallback, engine)
+        try {
+            tts?.shutdown()
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to shutdown previous TextToSpeech: ${e.message}")
+        }
+        tts = TextToSpeech(context, onInitListener, engine)
     }
 
     private fun setLanguage(language: String?, result: Result) {
@@ -558,11 +609,10 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
                 readVoiceProperties(voiceMap, voice)
                 voices.add(voiceMap)
             }
-            result.success(voices)
-        } catch (e: NullPointerException) {
-            Log.d(tag, "getVoices: " + e.message)
-            result.success(null)
+        } catch (e: Exception) {
+            Log.e(tag, "getVoices: " + e.message)
         }
+        result.success(voices)
     }
 
     private fun getLanguages(result: Result) {
@@ -681,7 +731,7 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
             }
         } else {
             ttsStatus = null
-            tts = TextToSpeech(context, onInitListenerWithoutCallback, selectedEngine)
+            tts = TextToSpeech(context, onInitListener, selectedEngine)
             false
         }
     }
@@ -689,66 +739,75 @@ class FlutterTtsPlugin : MethodCallHandler, FlutterPlugin {
     private fun stop() {
         if (awaitSynthCompletion) synth = false
         if (awaitSpeakCompletion) speaking = false
-        tts!!.stop()
+        tts?.stop()
     }
 
     private val maxSpeechInputLength: Int
         get() = TextToSpeech.getMaxSpeechInputLength()
 
-    private fun closeParcelFileDescriptor(isError: Boolean)  {
-        if (this.parcelFileDescriptor != null)  {
+    private fun closeParcelFileDescriptor(isError: Boolean) {
+        val descriptor = this.parcelFileDescriptor ?: return
+        this.parcelFileDescriptor = null
+        try {
             if (isError) {
-                this.parcelFileDescriptor!!.closeWithError("Error synthesizing TTS to file")
+                descriptor.closeWithError("Error synthesizing TTS to file")
             } else {
-                this.parcelFileDescriptor!!.close()
+                descriptor.close()
             }
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to close synthesizeToFile descriptor: ${e.message}")
         }
     }
 
-    private fun synthesizeToFile(text: String, fileName: String, isFullPath: Boolean) {
-        val fullPath: String
-        val uuid: String = UUID.randomUUID().toString()
-        bundle!!.putString(
-            TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID,
-            SYNTHESIZE_TO_FILE_PREFIX + uuid
-        )
+    private fun synthesizeToFile(text: String, fileName: String, isFullPath: Boolean): Boolean {
+        val tts = this.tts ?: return false
+        val bundle = this.bundle ?: return false
+        val utteranceId = SYNTHESIZE_TO_FILE_PREFIX + UUID.randomUUID().toString()
+        bundle.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
 
-        val result: Int =
-            if(isFullPath){
+        var fullPath: String = fileName
+        val result: Int = try {
+            if (isFullPath) {
                 val file = File(fileName)
                 fullPath = file.path
-
-                tts!!.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                tts.synthesizeToFile(text, bundle, file, utteranceId)
             } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val resolver = this.context?.contentResolver
+                val resolver = context?.contentResolver ?: return false
                 val contentValues = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                     put(MediaStore.MediaColumns.MIME_TYPE, "audio/wav")
                     put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MUSIC)
                 }
-                val uri = resolver?.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, contentValues)
-                this.parcelFileDescriptor = resolver?.openFileDescriptor(uri!!, "rw")
-                fullPath = uri?.path + File.separatorChar + fileName
-
-                tts!!.synthesizeToFile(text, bundle!!, parcelFileDescriptor!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                val uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, contentValues)
+                    ?: return false
+                val descriptor = resolver.openFileDescriptor(uri, "rw") ?: return false
+                this.parcelFileDescriptor = descriptor
+                fullPath = uri.path ?: fileName
+                tts.synthesizeToFile(text, bundle, descriptor, utteranceId)
             } else {
                 val musicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC)
                 val file = File(musicDir, fileName)
                 fullPath = file.path
-
-                tts!!.synthesizeToFile(text, bundle!!, file!!, SYNTHESIZE_TO_FILE_PREFIX + uuid)
+                tts.synthesizeToFile(text, bundle, file, utteranceId)
             }
+        } catch (e: Exception) {
+            Log.e(tag, "Failed to synthesize to file: ${e.message}")
+            TextToSpeech.ERROR
+        }
 
         if (result == TextToSpeech.SUCCESS) {
             Log.d(tag, "Successfully created file : $fullPath")
-        } else {
-            Log.d(tag, "Failed creating file : $fullPath")
+            return true
         }
+
+        Log.d(tag, "Failed creating file : $fullPath")
+        closeParcelFileDescriptor(true)
+        return false
     }
 
     private fun invokeMethod(method: String, arguments: Any) {
-        handler!!.post {
-            if (methodChannel != null) methodChannel!!.invokeMethod(
+        handler?.post {
+            methodChannel?.invokeMethod(
                 method,
                 arguments
             )

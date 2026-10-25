@@ -8,3 +8,6 @@ build/
 
 .flutter-plugins
 .flutter-plugins-dependencies
+
+# Flutter generated files
+**/ephemeral/*.env

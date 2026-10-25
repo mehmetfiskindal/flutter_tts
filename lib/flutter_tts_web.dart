@@ -39,15 +39,54 @@ class FlutterTtsPlugin {
   List<String> languages = [];
   Timer? t;
   bool supported = false;
+  Completer<void>? _voicesCompleter;
 
   FlutterTtsPlugin() {
     try {
       utterance = SpeechSynthesisUtterance();
       _listeners();
+      synth.onVoicesChanged = ((JSAny? _) {
+        _refreshVoices();
+      }).toJS;
+      _refreshVoices();
       supported = true;
     } catch (e) {
       print('Initialization of TTS failed. Functions are disabled. Error: $e');
     }
+  }
+
+  void _refreshVoices() {
+    voices = synth.getVoices().toDart;
+    languages = voices.map((voice) => voice.lang).toSet().toList();
+    final completer = _voicesCompleter;
+    if (completer != null && !completer.isCompleted && voices.isNotEmpty) {
+      completer.complete();
+    }
+  }
+
+  /// Web browsers load the voice list asynchronously. Wait for the
+  /// `voiceschanged` event (with a timeout) instead of returning an empty list.
+  Future<List<SpeechSynthesisVoice>> _ensureVoices() async {
+    var current = synth.getVoices().toDart;
+    if (current.isEmpty) {
+      final completer = _voicesCompleter ??= Completer<void>();
+      try {
+        await completer.future.timeout(const Duration(seconds: 2));
+      } on TimeoutException {
+        // Some browsers never fire voiceschanged. Fall through and return
+        // whatever is available.
+      }
+      if (identical(_voicesCompleter, completer)) {
+        _voicesCompleter = null;
+      }
+      current = synth.getVoices().toDart;
+    }
+
+    if (current.isNotEmpty) {
+      voices = current;
+      languages = current.map((voice) => voice.lang).toSet().toList();
+    }
+    return current;
   }
 
   void _listeners() {
@@ -72,10 +111,7 @@ class FlutterTtsPlugin {
     // });
     utterance.onEnd = (JSAny e) {
       ttsState = TtsState.stopped;
-      if (_speechCompleter != null) {
-        _speechCompleter?.complete();
-        _speechCompleter = null;
-      }
+      _completeSpeech(1);
       t?.cancel();
       channel.invokeMethod("speak.onComplete", null);
     }.toJS;
@@ -92,20 +128,22 @@ class FlutterTtsPlugin {
 
     utterance.onError = (JSObject event) {
       ttsState = TtsState.stopped;
-      if (_speechCompleter != null) {
-        _speechCompleter = null;
-      }
+      _completeSpeech(0);
       t?.cancel();
       print(event); // Log the entire event object to get more details
       channel.invokeMethod("speak.onError", event["error"]);
     }.toJS;
 
     utterance.onBoundary = (JSObject event) {
-      int charIndex = event['charIndex'] as int;
-      String name = event['name'] as String;
+      final data = event.dartify();
+      final eventMap = data is Map ? data : const <Object?, Object?>{};
+      final charIndexValue = eventMap['charIndex'];
+      final charIndex = charIndexValue is num ? charIndexValue.toInt() : 0;
+      final name = eventMap['name']?.toString() ?? '';
       if (name == 'sentence') return;
-      String text = utterance['text'] as String;
-      int endIndex = charIndex;
+      final text = utterance.text;
+      if (charIndex < 0 || charIndex > text.length) return;
+      var endIndex = charIndex;
       while (endIndex < text.length &&
           !RegExp(r'[\s,.!?]').hasMatch(text[endIndex])) {
         endIndex++;
@@ -122,18 +160,34 @@ class FlutterTtsPlugin {
   }
 
   Future<dynamic> handleMethodCall(MethodCall call) async {
-    if (!supported) return;
+    if (!supported) {
+      switch (call.method) {
+        case 'getLanguages':
+          return <String>[];
+        case 'getVoices':
+          return <Map<String, String>>[];
+        case 'isLanguageAvailable':
+          return false;
+        default:
+          return 0;
+      }
+    }
+
     switch (call.method) {
       case 'speak':
         final text = call.arguments as String?;
         if (awaitSpeakCompletion) {
-          _speechCompleter = Completer();
+          _speechCompleter = Completer<dynamic>();
         }
-        _speak(text);
+        final started = _speak(text);
+        if (started == 0) {
+          _completeSpeech(0);
+          return 0;
+        }
         if (awaitSpeakCompletion) {
           return _speechCompleter?.future;
         }
-        break;
+        return 1;
       case 'awaitSpeakCompletion':
         awaitSpeakCompletion = (call.arguments as bool?) ?? false;
         return 1;
@@ -145,16 +199,15 @@ class FlutterTtsPlugin {
         return 1;
       case 'setLanguage':
         final language = call.arguments as String;
-        _setLanguage(language);
-        return 1;
+        return await _setLanguage(language) ? 1 : 0;
       case 'getLanguages':
-        return _getLanguages();
+        return await _getLanguages();
       case 'getVoices':
-        return getVoices();
+        return await getVoices();
       case 'setVoice':
         final tmpVoiceMap =
             Map<String, String>.from(call.arguments as LinkedHashMap);
-        return _setVoice(tmpVoiceMap);
+        return await _setVoice(tmpVoiceMap);
       case 'setSpeechRate':
         final rate = call.arguments as double;
         _setRate(rate);
@@ -169,7 +222,7 @@ class FlutterTtsPlugin {
         return 1;
       case 'isLanguageAvailable':
         final lang = call.arguments as String;
-        return _isLanguageAvailable(lang);
+        return await _isLanguageAvailable(lang);
       default:
         throw PlatformException(
             code: 'Unimplemented',
@@ -178,22 +231,40 @@ class FlutterTtsPlugin {
     }
   }
 
-  void _speak(String? text) {
-    if (text == null || text.isEmpty) return;
-    if (ttsState == TtsState.stopped || ttsState == TtsState.paused) {
-      utterance.text = text;
-      if (ttsState == TtsState.paused) {
-        synth.resume();
-      } else {
-        synth.speak(utterance);
-      }
+  void _completeSpeech(dynamic value) {
+    final completer = _speechCompleter;
+    _speechCompleter = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete(value);
     }
   }
 
-  void _stop() {
-    if (ttsState != TtsState.stopped) {
-      synth.cancel();
+  int _speak(String? text) {
+    if (text == null || text.isEmpty) return 0;
+    if (ttsState == TtsState.playing || ttsState == TtsState.continued) {
+      return 0;
     }
+
+    if (ttsState == TtsState.paused) {
+      if (utterance.text == text) {
+        synth.resume();
+        return 1;
+      }
+      synth.cancel();
+      ttsState = TtsState.stopped;
+    }
+
+    utterance.text = text;
+    ttsState = TtsState.playing;
+    synth.speak(utterance);
+    return 1;
+  }
+
+  void _stop() {
+    synth.cancel();
+    ttsState = TtsState.stopped;
+    t?.cancel();
+    _completeSpeech(0);
   }
 
   void _pause() {
@@ -205,61 +276,74 @@ class FlutterTtsPlugin {
   void _setRate(double rate) => utterance.rate = rate;
   void _setVolume(double volume) => utterance.volume = volume;
   void _setPitch(double pitch) => utterance.pitch = pitch;
-  void _setLanguage(String language) {
-    var targetList = synth.getVoices().toDart.where((e) {
-      return e.lang.toLowerCase().startsWith(language.toLowerCase());
-    });
-    if (targetList.isNotEmpty) {
-      utterance.voice = targetList.first;
-      utterance.lang = targetList.first.lang;
-    }
-  }
 
-  void _setVoice(Map<String?, String?> voice) {
-    var tmpVoices = synth.getVoices().toDart;
-    var targetList = tmpVoices.where((e) {
-      return voice["name"] == e.name && voice["locale"] == e.lang;
-    });
-    if (targetList.isNotEmpty) {
-      utterance.voice = targetList.first;
-    }
-  }
+  Future<bool> _setLanguage(String language) async {
+    final normalized = language.trim().replaceAll('_', '-').toLowerCase();
+    if (normalized.isEmpty) return false;
 
-  bool _isLanguageAvailable(String? language) {
-    if (voices.isEmpty) _setVoices();
-    if (languages.isEmpty) _setLanguages();
-    for (var lang in languages) {
-      if (!language!.contains('-')) {
-        lang = lang.split('-').first;
+    final allVoices = await _ensureVoices();
+    SpeechSynthesisVoice? match;
+    for (final voice in allVoices) {
+      final voiceLocale = voice.lang.replaceAll('_', '-').toLowerCase();
+      if (voiceLocale == normalized || voiceLocale.startsWith('$normalized-')) {
+        match = voice;
+        break;
       }
-      if (lang.toLowerCase() == language.toLowerCase()) return true;
     }
+
+    if (match != null) {
+      utterance.voice = match;
+      utterance.lang = match.lang;
+      return true;
+    }
+
+    // No installed voice for the exact language. Keep the requested language
+    // so the browser can use its own fallback instead of silently continuing
+    // with the previous language.
+    utterance.voice = null;
+    utterance.lang = normalized;
     return false;
   }
 
-  List<String?>? _getLanguages() {
-    if (voices.isEmpty) _setVoices();
-    if (languages.isEmpty) _setLanguages();
+  Future<int> _setVoice(Map<String?, String?> voice) async {
+    final name = voice['name'];
+    final locale = voice['locale']?.replaceAll('_', '-').toLowerCase();
+    if (name == null || locale == null) return 0;
+
+    final allVoices = await _ensureVoices();
+    for (final candidate in allVoices) {
+      final candidateLocale = candidate.lang.replaceAll('_', '-').toLowerCase();
+      if (candidate.name == name && candidateLocale == locale) {
+        utterance.voice = candidate;
+        utterance.lang = candidate.lang;
+        return 1;
+      }
+    }
+    return 0;
+  }
+
+  Future<bool> _isLanguageAvailable(String? language) async {
+    if (language == null || language.trim().isEmpty) return false;
+    final normalized = language.trim().replaceAll('_', '-').toLowerCase();
+
+    final allVoices = await _ensureVoices();
+    return allVoices.any((voice) {
+      final voiceLocale = voice.lang.replaceAll('_', '-').toLowerCase();
+      return voiceLocale == normalized ||
+          (!normalized.contains('-') &&
+              voiceLocale.split('-').first == normalized);
+    });
+  }
+
+  Future<List<String>> _getLanguages() async {
+    await _ensureVoices();
     return languages;
   }
 
-  void _setVoices() {
-    voices = synth.getVoices().toDart;
-  }
-
   Future<List<Map<String, String>>> getVoices() async {
-    var tmpVoices = synth.getVoices().toDart;
-    return tmpVoices
+    final allVoices = await _ensureVoices();
+    return allVoices
         .map((voice) => {"name": voice.name, "locale": voice.lang})
         .toList();
-  }
-
-  void _setLanguages() {
-    var langs = <String>{};
-    for (var v in voices) {
-      langs.add(v.lang);
-    }
-
-    languages = langs.toList();
   }
 }

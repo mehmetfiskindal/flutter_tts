@@ -7,7 +7,8 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
   let iosAudioCategoryOptionsKey = "iosAudioCategoryOptionsKey"
   let iosAudioModeKey = "iosAudioModeKey"
 
-  let synthesizer = AVSpeechSynthesizer()
+  var synthesizer = AVSpeechSynthesizer()
+  var needsSynthesizerReset = false
   var rate: Float = AVSpeechUtteranceDefaultSpeechRate
   var volume: Float = 1.0
   var pitch: Float = 1.0
@@ -17,14 +18,16 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
   var autoStopSharedSession: Bool = true
   var speakResult: FlutterResult? = nil
   var synthResult: FlutterResult? = nil
+  var synthesizing = false
+  var synthGeneration = 0
   
   lazy var audioSession = AVAudioSession.sharedInstance()
   lazy var language: String = {
     AVSpeechSynthesisVoice.currentLanguageCode()
   }()
-  lazy var languages: Set<String> = {
+  var languages: Set<String> {
     Set(AVSpeechSynthesisVoice.speechVoices().map(\.language))
-  }()
+  }
     
 
   var channel = FlutterMethodChannel()
@@ -85,8 +88,7 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
       self.setPitch(pitch: Float(pitch), result: result)
       break
     case "stop":
-      self.stop()
-      result(1)
+      self.stop(result: result)
       break
     case "getLanguages":
       self.getLanguages(result: result)
@@ -136,103 +138,158 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
     }
   }
 
+  private func makeUtterance(text: String) -> AVSpeechUtterance {
+    let utterance = AVSpeechUtterance(string: text)
+    if let selectedVoice = self.voice {
+      utterance.voice = selectedVoice
+    } else if let languageVoice = AVSpeechSynthesisVoice(language: self.language) {
+      utterance.voice = languageVoice
+    }
+    utterance.rate = self.rate
+    utterance.volume = self.volume
+    utterance.pitchMultiplier = self.pitch
+    return utterance
+  }
+
+  /** Recreate the synthesizer after stop(). On several iOS versions an
+   * AVSpeechSynthesizer that has been stopped may no longer produce audio
+   * until the app is restarted (issue #627). */
+  private func resetSynthesizerIfNeeded() {
+    guard self.needsSynthesizerReset else { return }
+    self.synthesizer.delegate = nil
+    self.synthesizer = AVSpeechSynthesizer()
+    self.synthesizer.delegate = self
+    self.needsSynthesizerReset = false
+  }
+
+  private func completeSpeakResult(_ value: Int) {
+    if let pending = self.speakResult {
+      self.speakResult = nil
+      pending(value)
+    }
+  }
+
   private func speak(text: String, result: @escaping FlutterResult) {
+    self.resetSynthesizerIfNeeded()
+
     if (self.synthesizer.isPaused) {
       if (self.synthesizer.continueSpeaking()) {
         if self.awaitSpeakCompletion {
-          self.speakResult = result
+          if self.speakResult == nil {
+            self.speakResult = result
+          } else {
+            result(1)
+          }
         } else {
           result(1)
         }
       } else {
         result(0)
       }
-    } else {
-      let utterance = AVSpeechUtterance(string: text)
-      if self.voice != nil {
-        utterance.voice = self.voice!
-      } else {
-        utterance.voice = AVSpeechSynthesisVoice(language: self.language)
-      }
-      utterance.rate = self.rate
-      utterance.volume = self.volume
-      utterance.pitchMultiplier = self.pitch
+      return
+    }
 
-      self.synthesizer.speak(utterance)
-      if self.awaitSpeakCompletion {
-        self.speakResult = result
-      } else {
-        result(1)
-      }
+    // A new utterance supersedes a previous one that is still awaiting its
+    // completion callback. Complete the old call so its future does not hang.
+    self.completeSpeakResult(0)
+
+    let utterance = self.makeUtterance(text: text)
+    self.synthesizer.speak(utterance)
+    if self.awaitSpeakCompletion {
+      self.speakResult = result
+    } else {
+      result(1)
     }
   }
 
   private func synthesizeToFile(text: String, fileName: String, isFullPath: Bool, result: @escaping FlutterResult) {
-    var output: AVAudioFile?
-    var failed = false
-    let utterance = AVSpeechUtterance(string: text)
-
-    if self.voice != nil {
-      utterance.voice = self.voice!
-    } else {
-      utterance.voice = AVSpeechSynthesisVoice(language: self.language)
+    guard #available(iOS 13.0, *) else {
+      result(0)
+      return
     }
-    utterance.rate = self.rate
-    utterance.volume = self.volume
-    utterance.pitchMultiplier = self.pitch
 
-    if #available(iOS 13.0, *) {
-      self.synthesizer.write(utterance) { (buffer: AVAudioBuffer) in
-        guard let pcmBuffer = buffer as? AVAudioPCMBuffer else {
-            NSLog("unknow buffer type: \(buffer)")
-            failed = true
-            return
-        }
-        print(pcmBuffer.format)
-        if pcmBuffer.frameLength == 0 {
-            // finished
-        } else {
-          // append buffer to file
-          let fileURL: URL
-          if isFullPath {
-              fileURL = URL(fileURLWithPath: fileName)
-          } else {
-              fileURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!.appendingPathComponent(fileName)
-          }
-          NSLog("Saving utterance to file: \(fileURL.absoluteString)")
-
-        if output == nil {
-          do {
-            if #available(iOS 17.0, *) {
-                guard let audioFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: pcmBuffer.format.sampleRate, channels: 1, interleaved: false) else {
-                NSLog("Error creating audio format for iOS 17+")
-                failed = true
-                return
-              }
-              output = try AVAudioFile(forWriting: fileURL, settings: audioFormat.settings)
-            } else {
-              output = try AVAudioFile(forWriting: fileURL, settings: pcmBuffer.format.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
-            }
-          } catch {
-              NSLog("Error creating AVAudioFile: \(error.localizedDescription)")
-              failed = true
-              return
-          }
-        }
-
-
-          try! output!.write(from: pcmBuffer)
-        }
-      }
-    } else {
-        result("Unsupported iOS version")
+    if self.synthesizing {
+      result(0)
+      return
     }
-    if failed {
+
+    self.resetSynthesizerIfNeeded()
+
+    let fileURL: URL
+    if isFullPath {
+      fileURL = URL(fileURLWithPath: fileName)
+    } else {
+      guard let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
         result(0)
+        return
+      }
+      fileURL = documents.appendingPathComponent(fileName)
     }
+
+    self.synthesizing = true
+    self.synthGeneration += 1
+    let generation = self.synthGeneration
     if self.awaitSynthCompletion {
       self.synthResult = result
-    } else {
+    }
+
+    let utterance = self.makeUtterance(text: text)
+    var output: AVAudioFile?
+    var completed = false
+
+    let completion: (Int, String?) -> Void = { [weak self] success, message in
+      DispatchQueue.main.async {
+        guard let self = self, generation == self.synthGeneration, !completed else { return }
+        completed = true
+        self.synthesizing = false
+
+        if success == 1 {
+          self.channel.invokeMethod("synth.onComplete", arguments: nil)
+        } else {
+          self.channel.invokeMethod("synth.onError", arguments: message ?? "Error synthesizing TTS to file")
+        }
+
+        if self.awaitSynthCompletion {
+          let pending = self.synthResult
+          self.synthResult = nil
+          pending?(success)
+        }
+      }
+    }
+
+    NSLog("Saving utterance to file: \(fileURL.absoluteString)")
+    self.synthesizer.write(utterance) { (buffer: AVAudioBuffer) in
+      guard let pcmBuffer = buffer as? AVAudioPCMBuffer else {
+        completion(0, "Unknown buffer type")
+        return
+      }
+
+      if pcmBuffer.frameLength == 0 {
+        // A zero length buffer signals that the synthesis is complete.
+        completion(1, nil)
+        return
+      }
+
+      do {
+        if output == nil {
+          // Match the buffer format instead of forcing float32. Forcing a
+          // different format traps with EXC_BREAKPOINT for Int16 buffers
+          // (issue #632).
+          output = try AVAudioFile(
+            forWriting: fileURL,
+            settings: pcmBuffer.format.settings,
+            commonFormat: pcmBuffer.format.commonFormat,
+            interleaved: pcmBuffer.format.isInterleaved
+          )
+        }
+        try output?.write(from: pcmBuffer)
+      } catch {
+        NSLog("Error writing synthesized audio: \(error.localizedDescription)")
+        completion(0, error.localizedDescription)
+      }
+    }
+
+    if !self.awaitSynthCompletion {
       result(1)
     }
   }
@@ -245,14 +302,28 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
       }
   }
 
-  private func setLanguage(language: String, result: FlutterResult) {
-    if !(self.languages.contains(where: {$0.range(of: language, options: [.caseInsensitive, .anchored]) != nil})) {
-      result(0)
-    } else {
-      self.language = language
-      self.voice = nil
-      result(1)
+  private func resolveVoice(language: String) -> AVSpeechSynthesisVoice? {
+    if let voice = AVSpeechSynthesisVoice(language: language) {
+      return voice
     }
+    // Fall back to the base language when the requested region is not
+    // installed (for example bn-BD when iOS only ships bn-IN). This is better
+    // than silently continuing to use the previous language (issue #630).
+    let base = language.split(separator: "-").first.map(String.init) ?? language
+    if base != language {
+      return AVSpeechSynthesisVoice(language: base)
+    }
+    return nil
+  }
+
+  private func setLanguage(language: String, result: FlutterResult) {
+    guard let selectedVoice = self.resolveVoice(language: language) else {
+      result(0)
+      return
+    }
+    self.voice = selectedVoice
+    self.language = selectedVoice.language
+    result(1)
   }
 
   private func setRate(rate: Float) {
@@ -269,7 +340,7 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
   }
 
   private func setPitch(pitch: Float, result: FlutterResult) {
-    if (volume >= 0.5 && volume <= 2.0) {
+    if (pitch >= 0.5 && pitch <= 2.0) {
       self.pitch = pitch
       result(1)
     } else {
@@ -308,8 +379,18 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
     }
   }
 
-  private func stop() {
+  private func stop(result: FlutterResult) {
     self.synthesizer.stopSpeaking(at: AVSpeechBoundary.immediate)
+    // Complete any awaited speak call, otherwise its Dart future hangs.
+    self.completeSpeakResult(0)
+    if let pending = self.synthResult {
+      self.synthResult = nil
+      pending(0)
+    }
+    self.needsSynthesizerReset = true
+    self.synthGeneration += 1
+    self.synthesizing = false
+    result(1)
   }
 
   private func getLanguages(result: FlutterResult) {
@@ -327,18 +408,14 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
   }
 
   private func isLanguageAvailable(language: String, result: FlutterResult) {
-    var isAvailable: Bool = false
-    if (self.languages.contains(where: {$0.range(of: language, options: [.caseInsensitive, .anchored]) != nil})) {
-      isAvailable = true
-    }
-    result(isAvailable);
+    result(self.resolveVoice(language: language) != nil)
   }
 
   private func getVoices(result: FlutterResult) {
     if #available(iOS 9.0, *) {
       let voices = NSMutableArray()
-      var voiceDict: [String: String] = [:]
       for voice in AVSpeechSynthesisVoice.speechVoices() {
+        var voiceDict: [String: String] = [:]
         voiceDict["name"] = voice.name
         voiceDict["locale"] = voice.language
         voiceDict["quality"] = voice.quality.stringValue
@@ -374,28 +451,32 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
               let matchingVoices = AVSpeechSynthesisVoice.speechVoices().filter { $0.name == name && $0.language == locale }
               
               if !matchingVoices.isEmpty {
-                  // Sort voices by quality: premium (if available) > enhanced > others
-                  let sortedVoices = matchingVoices.sorted { (voice1, voice2) -> Bool in
-                      let quality1 = voice1.quality
-                      let quality2 = voice2.quality
-                      
-                      // macOS 13.0+ supports premium quality
+                  // Sort voices by quality: premium (if available) > enhanced > default.
+                  func qualityRank(_ quality: AVSpeechSynthesisVoiceQuality) -> Int {
                       if #available(iOS 16.0, *) {
-                          if quality1 == .premium {
-                              return true
-                          } else if quality1 == .enhanced && quality2 != .premium {
-                              return true
-                          } else {
-                              return false
-                          }
-                      } else {
-                          // Fallback for macOS versions before 13.0 (no premium)
-                          if quality1 == .enhanced {
-                              return true
-                          } else {
-                              return false
+                          switch quality {
+                          case .premium:
+                              return 3
+                          case .enhanced:
+                              return 2
+                          case .default:
+                              return 1
+                          @unknown default:
+                              return 0
                           }
                       }
+                      switch quality {
+                      case .enhanced:
+                          return 2
+                      case .default:
+                          return 1
+                      default:
+                          return 0
+                      }
+                  }
+
+                  let sortedVoices = matchingVoices.sorted {
+                      qualityRank($0.quality) > qualityRank($1.quality)
                   }
                   
                   // Select the highest quality voice
@@ -439,12 +520,12 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
       }
     }
     if self.awaitSpeakCompletion && self.speakResult != nil {
-        self.speakResult!(1)
-        self.speakResult = nil
+        self.completeSpeakResult(1)
     }
     if self.awaitSynthCompletion && self.synthResult != nil {
-      self.synthResult!(1)
+      let pending = self.synthResult
       self.synthResult = nil
+      pending?(1)
     }
     self.channel.invokeMethod("speak.onComplete", arguments: nil)
   }
@@ -462,6 +543,11 @@ public class SwiftFlutterTtsPlugin: NSObject, FlutterPlugin, AVSpeechSynthesizer
   }
 
   public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+    self.completeSpeakResult(0)
+    if let pending = self.synthResult {
+      self.synthResult = nil
+      pending(0)
+    }
     self.channel.invokeMethod("speak.onCancel", arguments: nil)
   }
 
@@ -487,6 +573,8 @@ extension AVSpeechSynthesisVoiceQuality {
             return "premium"
         case .enhanced:
             return "enhanced"
+        @unknown default:
+            return "unknown"
         }
     }
 }
@@ -500,6 +588,8 @@ extension AVSpeechSynthesisVoiceGender {
         case .female:
             return "female"
         case .unspecified:
+            return "unspecified"
+        @unknown default:
             return "unspecified"
         }
     }

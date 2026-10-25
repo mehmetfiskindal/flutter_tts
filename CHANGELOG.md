@@ -1,5 +1,67 @@
 # ChangeLog
 
+## 4.3.0
+
+### Features
+
+- Add `getVoicesForLanguage`, `getVoicesForLocale`, the pure
+  `filterVoicesByLocale` helper, and `TtsVoiceKeys` so voices can be selected
+  by language or locale without manual filtering (addresses #198).
+- Return typed values from the Dart API: `getLanguages`, `getEngines`,
+  `getVoices`, `getDefaultEngine`, `getDefaultVoice`, `isLanguageAvailable`,
+  `isLanguageInstalled`, and `areLanguagesInstalled`.
+- Add `TextToSpeechPlatform.macos`. `getSpeechRateValidRange` now reports
+  `macos` correctly and falls back safely for unknown platforms.
+- **Android:** Declare `TTS_SERVICE` in the plugin manifest so host apps no
+  longer need to add the `<queries>` element themselves (#641).
+- **Windows:** SAPI voices now include `identifier` and `gender`, and SAPI
+  `setLanguage` supports bare language codes.
+- **iOS/macOS:** `setLanguage` falls back to the base language when the exact
+  regional voice is unavailable (#630).
+
+### Fixes
+
+- **Android:** Clamp pause offsets to avoid the
+  `StringIndexOutOfBoundsException` on repeated pause (#638).
+- **Android:** Serialize initialization, replay queued calls outside the lock,
+  and guarantee a single reply to avoid initialization crashes and
+  `ReplyAlreadySubmitted` errors (#613, #599, #659).
+- **Android:** Complete `setSilence`, speak, stop, pause, and
+  `synthesizeToFile` futures reliably instead of leaving them pending.
+- **Android:** Release audio focus on synthesis errors and make
+  `synthesizeToFile` report failures to Dart instead of hanging.
+- **iOS:** Use the correct value when validating `setPitch` (it previously
+  checked the volume).
+- **iOS:** Rewrite `synthesizeToFile` to reply exactly once, support Int16
+  buffers, and match the buffer's native format (#632).
+- **iOS:** Recreate the speech synthesizer after `stop` so a later `speak`
+  works without restarting the app (#627).
+- **iOS/macOS:** Do not trap on unknown voice gender or quality values
+  (#649), and avoid reusing temporary voice dictionaries.
+- **macOS:** Fix crashes and `ReplyAlreadySubmitted` errors caused by
+  implicitly unwrapped, never-cleared results.
+- **macOS:** `synthesizeToFile` now applies the selected voice, rate, volume,
+  and pitch, and honors `isFullPath` (#606).
+- **Web:** Subscribe to `voiceschanged` so `getVoices` and `getLanguages` work
+  on browsers that load voices asynchronously.
+- **Web:** Always complete awaited speech on error or stop instead of hanging,
+  and return `1`/`0` from `speak`.
+- **Web:** `setLanguage` now falls back to the browser's language selection
+  when no exact voice is installed.
+- **Windows:** Fix a null result dereference when `stop` is called before
+  `speak` (#624).
+- **Windows:** Deliver completion and error events on the platform thread
+  (#629).
+- **Windows:** Fix `setLanguage` always succeeding, release voice tokens on
+  every path, and guard all method-call arguments.
+
+### Other
+
+- Add a root test suite with mocked platform channels and replace the stale
+  example counter test.
+- Add CI for formatting, analysis, tests, and the example web, Android, and
+  Windows builds.
+
 ## 4.2.5
 
 ### Fixes
